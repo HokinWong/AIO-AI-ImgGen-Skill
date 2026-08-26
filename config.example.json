@@ -1,0 +1,29 @@
+{
+  "default_provider": "openai",
+  "output_dir": "output/imagegen",
+  "providers": {
+    "openai": {
+      "kind": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-image-2",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    "gemini": {
+      "kind": "gemini",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "model": "gemini-3-pro-image-preview",
+      "api_key_env": "GEMINI_API_KEY"
+    },
+    "_第三方示例_复制后改名": {
+      "kind": "openai",
+      "base_url": "https://your-relay.example.com/v1",
+      "model": "gpt-image-2",
+      "api_key_env": "YOUR_RELAY_KEY"
+    },
+    "_MJ预留_暂不可用": {
+      "kind": "mj",
+      "base_url": "http://localhost:8080",
+      "api_key_env": "MJ_PROXY_KEY"
+    }
+  }
+}

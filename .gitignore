@@ -1,0 +1,14 @@
+# ===== 密钥与本地配置 —— 绝不提交 =====
+.env
+*.env
+config.json
+.imggen/
+
+# ===== 生成产物与缓存 =====
+output/
+.dsh-vision-router/
+.codex-review-raw.txt
+scripts/__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
