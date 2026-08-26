@@ -157,7 +157,11 @@ assert base_url_variants("https://api.x.com/v1") == [
 assert base_url_variants("https://api.x.com/v1/") == [
     "https://api.x.com/v1", "https://api.x.com"]          # 尾斜杠规范化
 assert base_url_variants("https://api.x.com/v1beta") == [
-    "https://api.x.com/v1beta", "https://api.x.com"]
+    # 修复：/vX 版本段 → 原样、去版本段、补 /v1 三种候选
+    "https://api.x.com/v1beta", "https://api.x.com",
+    "https://api.x.com/v1"]
+assert base_url_variants("https://api.x.com/v2") == [
+    "https://api.x.com/v2", "https://api.x.com", "https://api.x.com/v1"]
 assert base_url_variants("") == [""]
 
 assert is_route_error(_GenErr("x: 服务端返回空响应体"))
@@ -226,5 +230,143 @@ try:
     assert len(probe_calls) == 1, probe_calls   # 只打一次，不换路径
 finally:
     imggen.http_post = _unauth_post
+
+# ---- 本轮审查修复回归：大写X分隔符 / doctor只读无副作用 / --fix计数 ----
+from imggen import parse_size as _parse_size
+assert _parse_size("1080X1920") == (1080, 1920)        # 大写 X 分隔符
+
+dr_cfg = {"default_provider": "dr",
+          "output_dir": str(d / "nope-dr-output"),     # 绝不能被 doctor 创建
+          "providers": {"dr": {"kind": "openai",
+                               "base_url": "https://dr.test",
+                               "model": "gpt-image-2",
+                               "api_key": "sk-dr-key-abcdef"}}}
+dr_cfg_path = d / "dr-config.json"
+dr_cfg_path.write_text(json.dumps(dr_cfg), encoding="utf-8")
+os.environ["IMGGEN_CONFIG"] = str(dr_cfg_path)
+
+_real_probe = imggen.probe_base
+
+
+def fake_probe(base, kind, key, timeout=15):
+    return (True, "200 · 2 models") if "/v1" in base else (False, "empty body")
+
+
+imggen.probe_base = fake_probe
+try:
+    # 无 --fix：报告问题且不写回，返回 1
+    rc1 = imggen.cmd_doctor(imggen.load_config(require=False),
+                            argparse.Namespace(fix=False))
+    assert rc1 == 1
+    wrote1 = json.loads(dr_cfg_path.read_text(encoding="utf-8"))
+    assert wrote1["providers"]["dr"]["base_url"] == "https://dr.test"
+    # doctor 是只读体检：不得创建 output_dir
+    assert not (d / "nope-dr-output").exists()
+    # --fix：修正并写回 /v1，问题清零返回 0
+    rc2 = imggen.cmd_doctor(imggen.load_config(require=False),
+                            argparse.Namespace(fix=True))
+    assert rc2 == 0
+    wrote2 = json.loads(dr_cfg_path.read_text(encoding="utf-8"))
+    assert wrote2["providers"]["dr"]["base_url"] == "https://dr.test/v1"
+finally:
+    imggen.probe_base = _real_probe
+
+# ---- 审查修复回归 2：SSRF 校验 / 错误体脱敏 / 模型列表错误透传 / 原子写 ----
+from imggen import (validate_download_url as _vdu, scrub_secrets as _scrub,
+                    atomic_write_text as _awt, env_path as _env_path)
+
+# SSRF：拒绝非 http/https 与私网/环回，放行公网
+for bad in ("file:///etc/passwd", "ftp://x/y", "http://127.0.0.1:8080/a",
+            "http://10.0.0.5/img.png", "http://169.254.169.254/latest/meta",
+            "http://[::1]/x", "http://localhost:8000/x", "https://x.localhost/a"):
+    try:
+        _vdu(bad)
+        raise AssertionError(f"应拒绝: {bad}")
+    except imggen.GenError:
+        pass
+_vdu("https://img.example.com/a.png")   # 公网正常放行
+
+# 通用脱敏：sk- / AIza 前缀的 Key 被替换
+assert "sk-***" in _scrub('key="sk-abcdef1234567890" end')
+assert "sk-secret" not in _scrub("sk-secret9876543210")
+assert "AIza***" in _scrub("token=AIzaSyDc123456789")
+assert "sk-***" in _scrub("http://h/sk-abc12345")   # 路径/URL 中同样脱敏
+
+# 原子写：内容完整写入且成功替换
+_atomic_path = d / "atomic.json"
+_atomic_path.write_text("old", encoding="utf-8")
+_awt(_atomic_path, '{"ok": true}')
+assert json.loads(_atomic_path.read_text(encoding="utf-8")) == {"ok": True}
+
+# fetch_remote_models 错误透传：网络错误给原因，不再静默 None
+class _FakeOpenerErr:
+    def open(self, req, timeout=None):
+        raise imggen.urllib.error.URLError("boom")
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._p = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._p
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeOpenerOk:
+    def open(self, req, timeout=None):
+        return _FakeResp({"data": [{"id": "gpt-image-2"}, {"id": "x-embed"}]})
+
+
+_real_opener = imggen._OPENER
+try:
+    imggen._OPENER = _FakeOpenerErr()
+    ids, err = imggen.fetch_remote_models(
+        {"kind": "openai", "base_url": "https://r.test"}, "k")
+    assert ids is None and "boom" in err, (ids, err)
+    imggen._OPENER = _FakeOpenerOk()
+    ids2, err2 = imggen.fetch_remote_models(
+        {"kind": "openai", "base_url": "https://r.test"}, "k")
+    assert ids2 == ["gpt-image-2", "x-embed"] and err2 == ""
+finally:
+    imggen._OPENER = _real_opener
+
+# ---- 审查修复回归 3：Retry-After HTTP-date / 并发配置原子写 ----
+import time as _time
+import concurrent.futures as _cf
+
+# HTTP-date 格式：未来 ~60s → 服从服务端（60 上下，封顶 120）
+_future = _time.strftime("%a, %d %b %Y %H:%M:%S GMT",
+                         _time.gmtime(_time.time() + 60))
+_d_future = imggen._retry_delay(0, {"Retry-After": _future})
+assert 50 <= _d_future <= 120, _d_future
+# 过去时间 → max(0,...) 归零
+_past = _time.strftime("%a, %d %b %Y %H:%M:%S GMT",
+                       _time.gmtime(_time.time() - 60))
+assert imggen._retry_delay(0, {"Retry-After": _past}) == 0.0
+# 非法值 → 回退指数退避（[2,4,8]+抖动 0~1）
+_d_bad = imggen._retry_delay(0, {"Retry-After": "garbage"})
+assert 2.0 <= _d_bad <= 3.0, _d_bad
+
+# 并发原子写：50 线程并发写同一文件，最终必须为完整合法 JSON（无半截/混合）
+_conc = d / "conc.json"
+_conc.write_text("{}", encoding="utf-8")
+
+
+def _conc_writer(i):
+    imggen.atomic_write_text(_conc,
+                             json.dumps({"i": i, "pad": "x" * 500}))
+
+
+with _cf.ThreadPoolExecutor(max_workers=8) as _ex:
+    list(_ex.map(_conc_writer, range(50)))
+_conc_data = json.loads(_conc.read_text(encoding="utf-8"))  # 可解析即无损坏
+assert isinstance(_conc_data, dict) and "i" in _conc_data
+assert not [p for p in d.glob(".*conc.json.tmp-*")]         # 无残留临时文件
 
 print("imggen offline regression: ALL PASS")

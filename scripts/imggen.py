@@ -9,19 +9,26 @@ Providers:
 
 Commands:
   generate    生成 / 编辑一张或多张图
+  edit        图生图显式入口（强制 --ref）
   batch       从 JSONL 批量执行 generate 任务
+  setup       交互式配置向导（渠道/Key/模型/连通测试）
+  models      列出渠道可用模型（远端拉取 + 内置清单）
+  doctor      渠道体检（Key/路由/输出目录），--fix 自动修正 base_url
   providers   列出已配置的渠道 profile（key 只显示 set/unset）
   init-config 写出默认配置模板到 ~/.imggen/config.json
 
-Exit codes: 0 成功 | 1 生成失败（含部分失败）| 2 参数/配置错误
-"""
+Exit codes: 0 成功 | 1 生成失败 | 2 参数/配置错误 | 130 中断
+注意：Gemini 多张时若部分轮次失败，已成功的图仍会写出并返回 0
+（stderr 会明确警告"仅保留已完成的 N 张"）。"""
 
 from __future__ import annotations
 
 import argparse
 import base64
 import binascii
+import email.utils
 import io
+import ipaddress
 import json
 import mimetypes
 import os
@@ -35,6 +42,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 VERSION = "0.1.0"
@@ -124,7 +132,22 @@ def load_json_bytes(data: bytes, url: str = "") -> dict:
     try:
         return json.loads(data.decode("utf-8"))
     except Exception as exc:
-        raise GenError(f"响应不是合法 JSON：{exc}; body[:200]={data[:200]!r}")
+        raise GenError(f"响应不是合法 JSON：{exc}; "
+                       f"body[:200]={scrub_secrets(repr(data[:200]))}")
+
+
+# ---------------------------------------------------------------- secret scrubbing
+
+_KEY_RE = re.compile(r"(sk-[A-Za-z0-9_\-]{6,}|AIza[A-Za-z0-9_\-]{6,})")
+
+
+def scrub_secrets(text: str) -> str:
+    """通用脱敏：把形如 sk-xxx / AIza xxx 的 Key 值替换为前缀+***。
+    用于服务端错误体等可能回显 Key 的文本，防止间接泄露。"""
+    def rep(m: re.Match) -> str:
+        g = m.group(1)
+        return (g[:4] if g.startswith("AIza") else g[:3]) + "***"
+    return _KEY_RE.sub(rep, text)
 
 
 class _NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
@@ -145,14 +168,56 @@ class _NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoCrossHostRedirect)
 
 
+def validate_download_url(url: str) -> None:
+    """下载 URL 安全校验（SSRF 防护）：仅 http/https，拒绝本机/私网/链路本地，
+    并拒绝特殊 scheme。域名目标允许（DNS rebinding 属已知限制，单用户 CLI）。"""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError as exc:
+        raise GenError(f"下载地址无法解析：{url[:120]}") from None
+    if parts.scheme.lower() not in ("http", "https"):
+        raise GenError(f"拒绝下载非 http/https 地址：{url[:120]}")
+    host = (parts.hostname or "").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise GenError(f"拒绝下载指向本机的地址：{url[:120]}")
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return                                       # 域名：DNS rebinding 已知限制
+    if (ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+        raise GenError(f"拒绝下载指向非公网 IP 的地址：{url[:120]}")
+
+
+class _SafeDownloadRedirect(urllib.request.HTTPRedirectHandler):
+    """下载链路上的重定向也要逐跳做 URL 许可校验。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        validate_download_url(target)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_DL_OPENER = urllib.request.build_opener(_SafeDownloadRedirect)
+
+
 def _retry_delay(attempt: int, headers=None) -> float:
-    """基础指数退避 + 随机抖动；服务端给了 Retry-After 时优先服从。"""
+    """退避延迟：优先服从 Retry-After（支持秒数与 HTTP-date），
+    否则指数退避 + 随机抖动。"""
     if headers is not None:
         ra = headers.get("Retry-After") if hasattr(headers, "get") else None
         if ra:
             try:
                 return max(0.0, min(float(ra), 120.0))
             except (TypeError, ValueError):
+                pass
+            try:
+                dt = email.utils.parsedate_to_datetime(ra)
+                if dt:
+                    return max(0.0, min(
+                        (dt - datetime.now(timezone.utc)).total_seconds(),
+                        120.0))
+            except (TypeError, ValueError, OverflowError):
                 pass
     return RETRY_DELAYS[attempt] + random.uniform(0, 1)
 
@@ -192,18 +257,18 @@ def http_post(url: str, body: bytes, headers: dict, timeout: int,
 
 
 def extract_error_message(payload: bytes, status: int) -> str:
-    """尽量提取 API 错误信息；绝不包含鉴权头。"""
+    """尽量提取 API 错误信息；绝不包含鉴权头，并对 body 做 Key 脱敏。"""
     try:
         obj = json.loads(payload.decode("utf-8"))
         err = obj.get("error", obj)
         if isinstance(err, dict):
             msg = err.get("message") or err.get("status") or ""
             if msg:
-                return f" — {msg}"
-        return f" — {str(obj)[:300]}"
+                return f" — {scrub_secrets(str(msg))}"
+        return f" — {scrub_secrets(str(obj)[:300])}"
     except Exception:
         snippet = payload[:300].decode("utf-8", errors="replace")
-        return f" — body[:300]={snippet!r}"
+        return f" — body[:300]={scrub_secrets(snippet)!r}"
 
 
 def guess_mime(path: Path) -> str:
@@ -240,20 +305,19 @@ def read_ref(path_str: str) -> tuple[str, bytes, str]:
 # ---------------------------------------------------------------- base url probe
 
 def base_url_variants(base: str) -> list[str]:
-    """生成 base_url 探测变体：原样优先，其次补/去 /v1（含尾斜杠规范化）。"""
+    """生成 base_url 探测变体：原样优先，其次去版本段 / 补 /v1（含尾斜杠规范化）。"""
     b = (base or "").rstrip("/")
     if not b:
         return [b]
-    variants = [b]
-    if re.search(r"/v\d+[a-z]*$", b, re.IGNORECASE):
-        variants.append(re.sub(r"/v\d+[a-z]*$", "", b, flags=re.IGNORECASE))
-    else:
-        variants.append(b + "/v1")
-    seen, out = set(), []
-    for v in variants:
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
+    stripped = re.sub(r"/v\d+[a-z]*$", "", b,
+                      flags=re.IGNORECASE) if re.search(
+        r"/v\d+[a-z]*$", b, re.IGNORECASE) else None
+    out = [b]
+    if stripped and stripped not in out:
+        out.append(stripped)
+    v1 = (b if b.lower().endswith("/v1") else (stripped or b) + "/v1")
+    if v1 != b and v1 not in out:
+        out.append(v1)
     return out
 
 
@@ -266,30 +330,55 @@ def is_route_error(exc: GenError) -> bool:
             or "不是合法 JSON" in msg)   # HTML 错误页等
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    """原子写入：先写同目录临时文件再 os.replace，避免半截文件/并发覆盖。
+    Windows 上 replace 可能被瞬时占用（杀软/索引器）拒绝，做短退避重试。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex[:6]}")
+    tmp.write_text(text, encoding="utf-8")
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
+
+
 _config_lock = threading.Lock()
 
 
-def remember_base(prov_name: str, old_base: str, new_base: str) -> None:
-    """探测命中后备选 base_url 写回配置文件，下次直接用对的。"""
+def remember_base(prov_name: str, old_base: str, new_base: str) -> bool:
+    """探测命中后备选 base_url 写回配置文件。成功返回 True；
+    任何失败（读/写/JSON）都不抛异常，只 eprint 并返回 False——
+    base_url 修正属于增强，绝不能阻断已成功的图片写出。"""
     with _config_lock:
         path = config_path()
         try:
             if not path.is_file():
-                return
+                eprint(f"[{PROG}] 未找到配置文件 {path}，无法写回 base_url")
+                return False
             cfg = json.loads(path.read_text(encoding="utf-8"))
             prov = cfg.get("providers", {}).get(prov_name)
             if not isinstance(prov, dict):
-                return
+                return False
             if prov.get("base_url", "").rstrip("/") != old_base.rstrip("/"):
-                return                      # 配置已被他人修改，不覆盖
+                return False                 # 配置已被他人修改，不覆盖
             prov["base_url"] = new_base
-            path.write_text(
-                json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8")
+            atomic_write_text(path,
+                              json.dumps(cfg, ensure_ascii=False, indent=2)
+                              + "\n")
             eprint(f"[{PROG}] 已自动修正 profile '{prov_name}' base_url："
                    f"{old_base} → {new_base}（写回配置，下次直接生效）")
-        except OSError as exc:
+            return True
+        except (OSError, json.JSONDecodeError) as exc:
             eprint(f"[{PROG}] 本次使用 {new_base}；写回配置失败：{exc}")
+            return False
 
 
 # ---------------------------------------------------------------- setup/doctor helpers
@@ -318,20 +407,29 @@ def probe_base(base: str, kind: str, key: str, timeout: int = 15) \
 
 
 def fetch_remote_models(prov: dict, key: str, timeout: int = 30) \
-        -> list[str] | None:
-    """拉取渠道远端模型 id 列表（GET /models）；不可达返回 None。"""
+        -> tuple[list[str] | None, str]:
+    """拉取渠道远端模型 id 列表（GET /models）。
+    返回 (模型列表, "") 成功；失败 (None, 原因)，原因区分 HTTP/网络/解析。"""
     base = (prov.get("base_url") or "").rstrip("/")
     kind = prov.get("kind", "openai")
     if not base:
-        return None
+        return None, "base_url 为空"
     headers = ({"Authorization": f"Bearer {key}"} if kind == "openai"
                else {"x-goog-api-key": key})
     try:
         req = urllib.request.Request(base + "/models", headers=headers)
         with _OPENER.open(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.close()
+        except Exception:
+            pass
+        return None, f"HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return None, f"网络错误 {exc}"
+    except Exception as exc:
+        return None, f"响应解析失败 {type(exc).__name__}: {exc}"
     ids: list[str] = []
     if kind == "gemini":
         for m in data.get("models") or []:
@@ -342,18 +440,28 @@ def fetch_remote_models(prov: dict, key: str, timeout: int = 30) \
         for m in data.get("data") or []:
             if isinstance(m, dict) and m.get("id"):
                 ids.append(str(m["id"]))
-    return ids
+    return ids, ""
 
 
-def upsert_env_key(env_path: Path, name: str, value: str) -> None:
-    """向 .env 文件写入/更新一行 KEY=VALUE（不覆盖其他行）。"""
-    lines = (env_path.read_text(encoding="utf-8").splitlines()
-             if env_path.is_file() else [])
+def env_path() -> Path:
+    """统一 .env 路径：IMGGEN_ENV_FILE 显式路径优先，否则默认 ~/.imggen/.env。
+    setup 写入与 doctor 检查都必须走这里，保证读写一致。"""
+    explicit = os.environ.get("IMGGEN_ENV_FILE")
+    return (Path(explicit).expanduser() if explicit else DEFAULT_ENV_PATH)
+
+
+def upsert_env_key(env_path_: Path, name: str, value: str) -> None:
+    """向 .env 文件写入/更新一行 KEY=VALUE（原子写 + POSIX 仅属主可读写）。"""
+    lines = (env_path_.read_text(encoding="utf-8").splitlines()
+             if env_path_.is_file() else [])
     prefix = name + "="
     lines = [l for l in lines if not l.strip().startswith(prefix)]
     lines.append(f"{name}={value}")
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(env_path_, "\n".join(lines) + "\n")
+    try:
+        os.chmod(env_path_, 0o600)     # POSIX：收紧为仅当前用户可读写
+    except OSError:
+        pass                           # Windows 无此语义，忽略
 
 
 # ---------------------------------------------------------------- config
@@ -441,7 +549,7 @@ def parse_size(size: str | None) -> tuple[int, int] | None:
     low = size.lower()
     if low in SIZE_ALIASES:
         return SIZE_ALIASES[low]
-    m = re.match(r"^(\d{3,4})\s*[x×]\s*(\d{3,4})$", size.strip())
+    m = re.match(r"^(\d{3,4})\s*[xX×]\s*(\d{3,4})$", size.strip())
     if not m:
         raise UserError(f"--size 无效：'{size}'（示例：1080x1920 / portrait / auto）")
     w, h = int(m.group(1)), int(m.group(2))
@@ -566,11 +674,12 @@ def sniff_ext(data: bytes) -> str:
 
 
 def download_url(url: str, timeout: int = DEFAULT_TIMEOUT) -> bytes:
-    """下载中转站返回的图片 URL：带退避重试、大小上限与友好报错。"""
+    """下载中转站返回的图片 URL：带安全校验、退避重试、大小上限与友好报错。"""
+    validate_download_url(url)
     for attempt in range(3):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "imggen"})
-            with _OPENER.open(req, timeout=timeout) as r:
+            with _DL_OPENER.open(req, timeout=timeout) as r:
                 data = r.read(MAX_DOWNLOAD_BYTES + 1)
             if len(data) > MAX_DOWNLOAD_BYTES:
                 raise GenError(f"生成图超过下载上限"
@@ -647,27 +756,35 @@ def gemini_generate(prov_name: str, prov: dict, args) -> list[tuple[str, bytes]]
             resp = http_post(endpoint, json.dumps(body_obj).encode("utf-8"),
                              headers, args.timeout, f"gemini:{model}{suffix}")
             results.extend(extract_gemini_images(resp, round_i, rounds))
+            continue
         except GenError as exc:
-            msg = str(exc)
-            # 兼容层不支持 imageConfig 时自动降级重试一次
-            if not size_degraded and (
-                    "imageconfig" in msg.lower()
-                    or "unknown name" in msg.lower()):
-                size_degraded = True
-                eprint(f"[{PROG}] 端点似乎不支持 imageConfig，"
-                       f"本轮及后续轮次降级重试…")
+            payload = exc
+        # 兼容层不支持 imageConfig 时自动降级重试一次
+        recovered = False
+        if not size_degraded and (
+                "imageconfig" in str(payload).lower()
+                or "unknown name" in str(payload).lower()):
+            size_degraded = True
+            eprint(f"[{PROG}] 端点似乎不支持 imageConfig，"
+                   f"本轮及后续轮次降级重试…")
+            try:
                 body_obj = build_body(include_size=False)
-                resp = http_post(endpoint, json.dumps(body_obj).encode("utf-8"),
+                resp = http_post(endpoint,
+                                 json.dumps(body_obj).encode("utf-8"),
                                  headers, args.timeout,
                                  f"gemini:{model}(降级)")
                 results.extend(extract_gemini_images(resp, round_i, rounds))
-            elif results:
+                recovered = True
+            except GenError as exc2:
+                payload = exc2
+        if not recovered:
+            if results:
                 # 已有成功且已计费的轮次：不丢图，返回部分结果
                 eprint(f"[{PROG}] 警告：第 {round_i + 1}/{rounds} 张失败"
-                       f"（{msg[:200]}）；仅保留已完成的 {len(results)} 张")
+                       f"（{str(payload)[:200]}）；仅保留已完成的 "
+                       f"{len(results)} 张")
                 return results
-            else:
-                raise
+            raise GenError(str(payload)) from None
     return results
 
 
@@ -834,8 +951,6 @@ def validate_batch_job(ln: int, job: dict):
                 and (not isinstance(job[key], int) or isinstance(job[key], bool)
                      or job[key] < 1):
             raise UserError(f"batch 第 {ln} 行字段 '{key}' 应为 >=1 的整数")
-    if "n" in job and isinstance(job.get("n"), bool):
-        raise UserError(f"batch 第 {ln} 行字段 'n' 应为整数")
     if job.get("quality") is not None \
             and job["quality"] not in QUALITY_CHOICES:
         raise UserError(f"batch 第 {ln} 行 quality 非法：{job['quality']!r}"
@@ -955,8 +1070,10 @@ def cmd_init_config(args) -> int:
 
 
 def cmd_models(cfg: dict, args) -> int:
-    """列出渠道可用模型：远端 GET /models（免费）+ 内置图像模型清单。"""
+    """列出渠道可用模型：远端 GET /models（免费）+ 内置图像模型清单。
+    任一渠道远端不可达时返回非零。"""
     names = [args.provider] if args.provider else list(cfg["providers"])
+    failed = False
     for name in names:
         prov = cfg["providers"].get(name)
         if prov is None:
@@ -965,14 +1082,16 @@ def cmd_models(cfg: dict, args) -> int:
         kind = prov.get("kind", "?")
         current = args.model or prov.get("model", "")
         print(f"\n== {name}  (kind={kind} · {prov.get('base_url', '')})")
-        remote = None
+        remote: list[str] | None = None
+        err = ""
         try:
-            remote = fetch_remote_models(prov, resolve_key(name, prov))
-        except UserError:
-            pass
+            remote, err = fetch_remote_models(prov, resolve_key(name, prov))
+        except UserError as exc:
+            err = str(exc)
         if remote is None:
-            print("   远端模型列表不可达（Key 未配置或端点不支持），"
-                  "仅显示内置清单")
+            print(f"   远端模型列表不可达：{err or '未知错误'}；"
+                  f"仅显示内置清单")
+            failed = True
         else:
             hits = [m for m in remote
                     if any(h in m.lower() for h in IMAGE_MODEL_HINTS)]
@@ -985,7 +1104,7 @@ def cmd_models(cfg: dict, args) -> int:
             for m in known:
                 print(f"     - {m}" + ("   ← 当前" if m == current else ""))
         print("   使用 -m <模型名> 单次覆盖；改 profile 的 model 字段设为默认")
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_doctor(cfg: dict, args) -> int:
@@ -995,15 +1114,20 @@ def cmd_doctor(cfg: dict, args) -> int:
     cfg_state = ("✓ 存在" if path.is_file()
                  else "✗ 缺失（运行 setup 向导或 init-config）")
     print(f"[config] {path} — {cfg_state}")
-    env_state = ("✓ 存在" if DEFAULT_ENV_PATH.is_file()
-                 else "— 不存在（可选）")
-    print(f"[.env  ] {DEFAULT_ENV_PATH} — {env_state}")
+    env_f = env_path()
+    env_state = ("✓ 存在" if env_f.is_file() else "— 不存在（可选）")
+    print(f"[.env  ] {env_f} — {env_state}")
     out_dir = cfg.get("output_dir", "output/imagegen")
-    try:
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
+    # 只读检查：不创建目录。目录存在则查写入位；不存在则查最近存在的祖先
+    od = Path(out_dir)
+    anc = od
+    while not anc.exists() and anc != anc.parent:
+        anc = anc.parent
+    out_ok = bool(anc.exists()) and os.access(anc, os.W_OK)
+    if out_ok:
         print(f"[output] {out_dir} — ✓ 可写")
-    except OSError as exc:
-        print(f"[output] {out_dir} — ✗ 不可写：{exc}")
+    else:
+        print(f"[output] {out_dir} — ✗ 不可写（父目录 {anc} 不存在或无写权限）")
         issues += 1
     for name, prov in cfg["providers"].items():
         kind = prov.get("kind", "?")
@@ -1031,12 +1155,16 @@ def cmd_doctor(cfg: dict, args) -> int:
         if good:
             print(f"[{name}] ✗ {cur[0]} 不可用（{cur[2]}）；"
                   f"{good[0]} 可用（{good[2]}）")
-            if args.fix:
-                remember_base(name, results[0][0], good[0])
+            if args.fix and remember_base(name, results[0][0], good[0]):
                 ready += 1
+                print("       → 已自动修正并写回配置")
+            elif args.fix:
+                print("       → 写回配置失败（见 stderr），本次按可用地址"
+                      "探测但下次仍会重试")
+                issues += 1
             else:
                 print("        → 运行 imggen doctor --fix 可自动写回")
-            issues += 1
+                issues += 1
         else:
             print(f"[{name}] ✗ 所有变体均不可达："
                   + "；".join(f"{r[0]} → {r[2]}" for r in results))
@@ -1049,7 +1177,11 @@ def cmd_setup(cfg: dict, args) -> int:
     """交互式配置向导：渠道 → base_url → Key(getpass) → 模型 → 连通测试 → 写配置。"""
     import getpass
 
-    interactive = sys.stdin.isatty() and not args.yes
+    interactive = sys.stdin.isatty()
+    if not interactive and not args.yes:
+        raise UserError(
+            "非交互终端未加 --yes：为防止静默覆盖配置，脚本场景必须显式"
+            "确认（--yes）。同时请提供 --kind/--provider/--model 等参数。")
 
     def ask(prompt: str, default: str = "") -> str:
         try:
@@ -1102,8 +1234,9 @@ def cmd_setup(cfg: dict, args) -> int:
         key_value = getpass.getpass(
             "粘贴 API Key（不回显；回车跳过稍后自行配置）: ").strip()
         if key_value:
-            upsert_env_key(DEFAULT_ENV_PATH, env_name, key_value)
-            print(f"  已写入 {DEFAULT_ENV_PATH}（{env_name}=***）")
+            env_file = env_path()
+            upsert_env_key(env_file, env_name, key_value)
+            print(f"  已写入 {env_file}（{env_name}=***）")
 
     # 5) 模型：远端列表优先（过滤图像相关），内置清单兜底
     model = args.model
@@ -1111,9 +1244,9 @@ def cmd_setup(cfg: dict, args) -> int:
         probe_key = key_value or os.environ.get(env_name, "")
         pool = list(KNOWN_IMAGE_MODELS.get(kind, []))
         if probe_key:
-            remote = fetch_remote_models({"kind": kind, "base_url": base},
-                                         probe_key)
-            hits = [m for m in (remote or [])
+            ids, _err = fetch_remote_models({"kind": kind, "base_url": base},
+                                            probe_key)
+            hits = [m for m in (ids or [])
                     if any(h in m.lower() for h in IMAGE_MODEL_HINTS)]
             if hits:
                 pool = hits
@@ -1157,9 +1290,7 @@ def cmd_setup(cfg: dict, args) -> int:
     if set_default or not cfg.get("default_provider"):
         cfg["default_provider"] = name
     path = config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8")
+    atomic_write_text(path, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
 
     print("\n配置完成：")
     print(f"  配置文件  {path}")
@@ -1196,34 +1327,27 @@ def add_generate_args(sp):
 # ---------------------------------------------------------------- env file
 
 def load_env_file() -> int:
-    """可选 .env 自动加载：$IMGGEN_ENV_FILE 显式路径优先，其次 ~/.imggen/.env。
-    只加载第一个存在的文件；绝不覆盖进程已有的环境变量；不打印任何值。"""
-    candidates: list[Path] = []
-    explicit = os.environ.get("IMGGEN_ENV_FILE")
-    if explicit:
-        candidates.append(Path(explicit).expanduser())
-    candidates.append(Path.home() / ".imggen" / ".env")
-
-    for path in candidates:
-        if not path.is_file():
-            continue
-        loaded = 0
-        try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                name, _, value = line.partition("=")
-                name = name.strip()
-                value = value.strip().strip('"').strip("'")
-                if name and value and name not in os.environ:
-                    os.environ[name] = value
-                    loaded += 1
-        except OSError as exc:
-            eprint(f"[{PROG}] 警告：读取 {path} 失败：{exc}")
-            return 0
-        return loaded
-    return 0
+    """可选 .env 自动加载（路径与 setup 写入统一由 env_path() 决定）。
+    绝不覆盖进程已有的环境变量；不打印任何值。"""
+    path = env_path()
+    if not path.is_file():
+        return 0
+    loaded = 0
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            name = name.strip()
+            value = value.strip().strip('"').strip("'")
+            if name and value and name not in os.environ:
+                os.environ[name] = value
+                loaded += 1
+    except OSError as exc:
+        eprint(f"[{PROG}] 警告：读取 {path} 失败：{exc}")
+        return 0
+    return loaded
 
 
 def main(argv=None) -> int:
@@ -1302,7 +1426,8 @@ def main(argv=None) -> int:
     try:
         if getattr(args, "cmd", None) == "init-config":
             return args.fn({}, args)
-        if getattr(args, "cmd", None) == "setup":
+        if getattr(args, "cmd", None) in ("setup", "doctor"):
+            # 两者都应在"无配置"状态下可运行：setup 创建配置，doctor 报告缺失
             return args.fn(load_config(require=False), args)
         cfg = load_config()
         rc = args.fn(cfg, args)
@@ -1316,6 +1441,12 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         eprint(f"\n[{PROG}] 已中断")
         return 130
+    except BrokenPipeError:      # 下游（管道/编辑器）提前关闭 stdout，静默退出
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        return 0
     except Exception as exc:      # 防意外 traceback：任何未预期错误都友好退出
         eprint(f"[{PROG}] 未预期的错误（{type(exc).__name__}）：{exc}")
         return 1
