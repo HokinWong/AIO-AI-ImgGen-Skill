@@ -369,4 +369,51 @@ _conc_data = json.loads(_conc.read_text(encoding="utf-8"))  # 可解析即无损
 assert isinstance(_conc_data, dict) and "i" in _conc_data
 assert not [p for p in d.glob(".*conc.json.tmp-*")]         # 无残留临时文件
 
+# ---- setup 交互分支：模拟 TTY 全流程（打桩 isatty/input/getpass/probe）----
+import builtins as _b
+import getpass as _gp
+
+setup_cfg_path = d / "setup-interactive.json"
+setup_env_path = d / "setup-interactive.env"
+os.environ["IMGGEN_CONFIG"] = str(setup_cfg_path)
+os.environ["IMGGEN_ENV_FILE"] = str(setup_env_path)
+
+_real_stdin, _real_input, _real_getpass = imggen.sys.stdin, _b.input, _gp.getpass
+_real_fetch = imggen.fetch_remote_models
+_real_probe2 = imggen.probe_base
+
+# 模拟用户输入序列（对应 cmd_setup 逐个 ask）：
+#   kind=2(Gemini) / base_url / profile 名 / env 名 / 模型序号 1 / 设为默认 y
+_answers = iter(["2", "https://nano.test", "nano", "NANO_API_KEY", "1", "y"])
+imggen.sys.stdin = type("_TTY", (), {"isatty": lambda self: True})()
+_b.input = lambda prompt="": next(_answers)
+_gp.getpass = lambda prompt="": "sk-test-gemini-key-123456"   # 不回显输入
+imggen.fetch_remote_models = lambda prov, key, timeout=30: (
+    ["gemini-3-pro-image-preview", "gemini-2.5-flash-image", "text"], "")
+imggen.probe_base = lambda base, kind, key, timeout=15: (
+    (True, "200 · 2 models") if "/v1" in base else (False, "HTTP 404"))
+try:
+    rc = imggen.cmd_setup(imggen.load_config(require=False),
+                          argparse.Namespace(provider=None, kind=None,
+                                             base_url=None, api_key_env=None,
+                                             model=None, yes=False, force=False))
+    assert rc == 0
+    scfg = json.loads(setup_cfg_path.read_text(encoding="utf-8"))
+    prov = scfg["providers"]["nano"]
+    assert prov == {"kind": "gemini", "base_url": "https://nano.test/v1",
+                    "model": "gemini-3-pro-image-preview",
+                    "api_key_env": "NANO_API_KEY"}, prov
+    assert scfg["default_provider"] == "nano"
+    # Key 写入统一 env_path()（IMGGEN_ENV_FILE 指向处），且不触碰真实 .env
+    assert setup_env_path.is_file()
+    assert "NANO_API_KEY=sk-test-gemini-key-123456" in \
+        setup_env_path.read_text(encoding="utf-8")
+    assert not imggen.DEFAULT_ENV_PATH.is_file() or \
+        "NANO_API_KEY" not in imggen.DEFAULT_ENV_PATH.read_text(
+            encoding="utf-8", errors="replace")
+finally:
+    imggen.sys.stdin, _b.input, _gp.getpass = _real_stdin, _real_input, _real_getpass
+    imggen.fetch_remote_models, imggen.probe_base = _real_fetch, _real_probe2
+    os.environ.pop("IMGGEN_ENV_FILE", None)
+
 print("imggen offline regression: ALL PASS")
